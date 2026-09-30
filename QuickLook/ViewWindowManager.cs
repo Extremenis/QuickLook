@@ -78,6 +78,10 @@ public class ViewWindowManager : IDisposable
         if (string.IsNullOrEmpty(path))
             path = NativeMethods.QuickLook.GetCurrentSelection();
 
+        KeyboardLog.Write(string.IsNullOrEmpty(path)
+            ? $"Toggle: no selection returned (visible={_viewerWindow.IsVisible})"
+            : $"Toggle: selection received (visible={_viewerWindow.IsVisible}, same={path == _invokedPath})");
+
         if (!string.IsNullOrEmpty(options))
             InvokePreviewWithOption(path, options);
         else
