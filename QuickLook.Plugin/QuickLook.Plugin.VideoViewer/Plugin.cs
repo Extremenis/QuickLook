@@ -46,16 +46,26 @@ public sealed class Plugin : IViewer
 
     private static readonly MediaInfoNative _mediaInfo;
 
+    /// <summary>
+    /// Separate handle for <see cref="ProbeIsMedia"/>: calling Open() on a handle previously
+    /// used in buffer mode crashes MediaInfo with an access violation.
+    /// </summary>
+    private static readonly MediaInfoNative _probeMediaInfo;
+
     private ViewerPanel _vp;
 
     public int Priority => -3;
 
     static Plugin()
     {
-        _mediaInfo = new(Path.Combine(
+        var nativePath = Path.Combine(
             Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location),
-            Environment.Is64BitProcess ? @"runtimes\win-x64\native\" : @"runtimes\win-x86\native\"));
+            Environment.Is64BitProcess ? @"runtimes\win-x64\native\" : @"runtimes\win-x86\native\");
+
+        _mediaInfo = new(nativePath);
         _mediaInfo.Option("Cover_Data", "base64");
+
+        _probeMediaInfo = new(nativePath);
     }
 
     public void Init()
@@ -118,7 +128,7 @@ public sealed class Plugin : IViewer
         try
         {
             long total = 0;
-            _mediaInfo.OpenBufferInit(fs.Length, 0);
+            _probeMediaInfo.OpenBufferInit(fs.Length, 0);
             while (total < MaxProbeBytes)
             {
                 int read = fs.Read(buffer, 0, (int)Math.Min(buffer.Length, MaxProbeBytes - total));
@@ -127,25 +137,25 @@ public sealed class Plugin : IViewer
                 total += read;
 
                 // Bit 3 (0x08): MediaInfo has finished parsing
-                if ((_mediaInfo.OpenBufferContinue(handle.AddrOfPinnedObject(), (IntPtr)read) & 0x08) != 0)
+                if ((_probeMediaInfo.OpenBufferContinue(handle.AddrOfPinnedObject(), (IntPtr)read) & 0x08) != 0)
                     break;
 
-                long goTo = _mediaInfo.OpenBufferContinueGoToGet();
+                long goTo = _probeMediaInfo.OpenBufferContinueGoToGet();
                 if (goTo != -1)
                 {
                     fs.Seek(goTo, SeekOrigin.Begin);
-                    _mediaInfo.OpenBufferInit(fs.Length, fs.Position);
+                    _probeMediaInfo.OpenBufferInit(fs.Length, fs.Position);
                 }
             }
-            _mediaInfo.OpenBufferFinalize();
+            _probeMediaInfo.OpenBufferFinalize();
         }
         finally
         {
             handle.Free();
         }
 
-        return !string.IsNullOrWhiteSpace(_mediaInfo.Get(StreamKind.Video, 0, "Format"))
-            || !string.IsNullOrWhiteSpace(_mediaInfo.Get(StreamKind.Audio, 0, "Format"));
+        return !string.IsNullOrWhiteSpace(_probeMediaInfo.Get(StreamKind.Video, 0, "Format"))
+            || !string.IsNullOrWhiteSpace(_probeMediaInfo.Get(StreamKind.Audio, 0, "Format"));
     }
 
     public void Prepare(string path, ContextObject context)
