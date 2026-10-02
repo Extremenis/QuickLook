@@ -32,6 +32,9 @@ internal static class KeyboardLog
 {
     private const long MAX_SIZE = 512 * 1024;
 
+    /// <summary>Preview phases slower than this block switching to the next file and get logged.</summary>
+    private const long SLOW_PREVIEW_PHASE_MS = 100;
+
     private static readonly string LogPath = Path.Combine(SettingHelper.LocalDataPath, "QuickLook.Keyboard.log");
 
     // Bounded so that a stuck disk can never make the keyboard hook wait or grow memory.
@@ -53,6 +56,16 @@ internal static class KeyboardLog
     public static void Write(string message)
     {
         Queue.TryAdd($"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} [T{Thread.CurrentThread.ManagedThreadId}] {message}");
+    }
+
+    /// <summary>
+    /// Logs a preview phase that ran on the UI thread only when it was slow enough to delay
+    /// the next selection change, naming the plugin and file type, never the file name.
+    /// </summary>
+    public static void WriteIfSlow(string phase, long elapsedMs)
+    {
+        if (elapsedMs >= SLOW_PREVIEW_PHASE_MS)
+            Write($"Slow preview {phase}: {elapsedMs} ms");
     }
 
     private static void WriteLoop()
