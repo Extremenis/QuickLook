@@ -64,8 +64,12 @@ public sealed class Plugin : IViewer
 
         _mediaInfo = new(nativePath);
         _mediaInfo.Option("Cover_Data", "base64");
+        // Only header fields (format, size, rotation, tags, cover) are used. The default parse
+        // speed also samples the stream, reading tens of MB per file and stalling on slow disks.
+        _mediaInfo.Option("ParseSpeed", "0");
 
         _probeMediaInfo = new(nativePath);
+        _probeMediaInfo.Option("ParseSpeed", "0");
     }
 
     public void Init()
