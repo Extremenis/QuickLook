@@ -51,9 +51,21 @@ public partial class App : Application
 
     private bool _cleanExit = true;
     private Mutex _isRunning;
+    private ExplorerTooltipSuppressor _tooltipSuppressor;
 
     static App()
     {
+        // Compile what the previous run used at startup on spare cores, in parallel with the startup itself
+        try
+        {
+            System.Runtime.ProfileOptimization.SetProfileRoot(SettingHelper.LocalDataPath);
+            System.Runtime.ProfileOptimization.StartProfile("QuickLook.Startup.jitprofile");
+        }
+        catch
+        {
+            // data folder not writable yet: EnsureFolderWritable reports it
+        }
+
         // Set the process render mode based on the user setting
         var processRenderMode = SettingHelper.Get("ProcessRenderMode", failsafe: (int)RenderMode.Default, "QuickLook");
         if (processRenderMode == (int)RenderMode.SoftwareOnly)
@@ -268,6 +280,7 @@ public partial class App : Application
         PipeServerManager.GetInstance().Dispose();
         TrayIconManager.GetInstance().Dispose();
         KeystrokeDispatcher.GetInstance().Dispose();
+        _tooltipSuppressor?.Dispose();
         ViewWindowManager.GetInstance().Dispose();
     }
 
@@ -359,9 +372,18 @@ public partial class App : Application
 
         NativeMethods.QuickLook.Init();
 
+        var sw = Stopwatch.StartNew();
         PluginManager.GetInstance();
+        var pluginsMs = sw.ElapsedMilliseconds;
+        sw.Restart();
         ViewWindowManager.GetInstance();
+        KeyboardLog.Write($"Startup: plugins {pluginsMs} ms, viewer window {sw.ElapsedMilliseconds} ms, since process start {(DateTime.Now - Process.GetCurrentProcess().StartTime).TotalMilliseconds:F0} ms");
         KeystrokeDispatcher.GetInstance();
+        _tooltipSuppressor = new ExplorerTooltipSuppressor();
         PipeServerManager.GetInstance();
+
+        // At logon, the warm-up waits so that it does not slow down the rest of the boot
+        var warmUpDelay = e.Args.Contains("/autorun") ? TimeSpan.FromSeconds(45) : TimeSpan.Zero;
+        PluginManager.GetInstance().WarmUp(warmUpDelay);
     }
 }

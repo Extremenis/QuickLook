@@ -15,6 +15,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+using QuickLook.Common.ExtensionMethods;
 using QuickLook.Common.Helpers;
 using QuickLook.Common.Plugin;
 using QuickLook.Helpers;
@@ -30,6 +31,11 @@ public class ViewWindowManager : IDisposable
     private static ViewWindowManager _instance;
 
     private string _invokedPath = string.Empty;
+
+    /// <summary>
+    /// The path the plugin shows: <see cref="_invokedPath"/>, or its temporary copy for an archive entry.
+    /// </summary>
+    private string _previewPath = string.Empty;
     private ViewerWindow _viewerWindow;
 
     internal ViewWindowManager()
@@ -64,6 +70,70 @@ public class ViewWindowManager : IDisposable
         _viewerWindow.RunAndClose();
     }
 
+    /// <summary>
+    /// True while the preview holds edits that are not saved yet. A plugin's view reports them through a
+    /// public bool HasUnsavedChanges property (plugins don't share an interface for it).
+    /// </summary>
+    internal bool HasUnsavedChanges()
+    {
+        if (!_viewerWindow.IsVisible)
+            return false;
+
+        var content = _viewerWindow.ContextObject?.ViewerContent;
+        return content?.GetType().GetProperty("HasUnsavedChanges")?.GetValue(content) is true;
+    }
+
+    /// <summary>
+    /// True when the last Escape only took the keyboard focus out of the preview's editor (the view
+    /// reports it through a public bool ConsumeEscape() method), so it must not also close the preview.
+    /// </summary>
+    internal bool ConsumeEscape()
+    {
+        if (!_viewerWindow.IsVisible)
+            return false;
+
+        var content = _viewerWindow.ContextObject?.ViewerContent;
+        return content?.GetType().GetMethod("ConsumeEscape", Type.EmptyTypes)?.Invoke(content, null) is true;
+    }
+
+    /// <summary>
+    /// Closes the preview and opens the selected file with the program associated with its "edit" verb,
+    /// or with its default program when it has none.
+    /// </summary>
+    public void EditAndClosePreview(string path = null)
+    {
+        if (string.IsNullOrEmpty(path))
+            path = NativeMethods.QuickLook.GetCurrentSelection();
+        if (string.IsNullOrEmpty(path))
+            path = _invokedPath;
+
+        ClosePreview();
+
+        if (string.IsNullOrEmpty(path) || Directory.Exists(path) || path.StartsWith("::"))
+            return;
+
+        KeyboardLog.Write($"Edit: opening the selection ({Path.GetExtension(path)})");
+
+        foreach (var verb in new[] { "edit", null })
+        {
+            try
+            {
+                using var _ = Process.Start(new ProcessStartInfo(path)
+                {
+                    Verb = verb,
+                    UseShellExecute = true,
+                    WorkingDirectory = Path.GetDirectoryName(path),
+                });
+                return;
+            }
+            catch (Exception e)
+            {
+                // no "edit" verb registered for this type: fall back to the default program
+                KeyboardLog.Write($"Edit: verb '{verb ?? "default"}' failed: {e.Message}");
+            }
+        }
+    }
+
     public void ClosePreview()
     {
         if (!_viewerWindow.IsVisible)
@@ -77,6 +147,10 @@ public class ViewWindowManager : IDisposable
     {
         if (string.IsNullOrEmpty(path))
             path = NativeMethods.QuickLook.GetCurrentSelection();
+
+        KeyboardLog.Write(string.IsNullOrEmpty(path)
+            ? $"Toggle: no selection returned (visible={_viewerWindow.IsVisible})"
+            : $"Toggle: selection received (visible={_viewerWindow.IsVisible}, same={path == _invokedPath})");
 
         if (!string.IsNullOrEmpty(options))
             InvokePreviewWithOption(path, options);
@@ -151,28 +225,60 @@ public class ViewWindowManager : IDisposable
         if (_viewerWindow.IsVisible && path == _invokedPath)
             return;
 
+        // A file inside an archive shown as a folder (e.g. "C:\dir\file.zip\inner.txt") is previewed
+        // from a temporary copy; _invokedPath keeps the original path so toggling still closes it.
+        var previewPath = path;
+        IViewer archiveFolderViewer = null;
         var isDirectory = Directory.Exists(path);
-        if (!isDirectory && !File.Exists(path))
-            if (!path.StartsWith("::")) // CLSID
+        if (!isDirectory && !File.Exists(path) && !path.StartsWith("::")) // CLSID
+        {
+            var sw0 = Stopwatch.StartNew();
+            previewPath = ArchiveEntryHelper.TryExtract(path);
+            KeyboardLog.WriteIfSlow("extract archive entry", sw0.ElapsedMilliseconds);
+
+            // A folder inside an archive: the archive viewer lists it straight from the archive.
+            if (previewPath == null && ArchiveEntryHelper.IsArchiveFolder(path))
+            {
+                archiveFolderViewer = PluginManager.GetInstance().LoadedPlugins
+                    .Find(p => p.GetType().Assembly.GetName().Name == "QuickLook.Plugin.ArchiveViewer")
+                    ?.GetType().CreateInstance<IViewer>();
+                previewPath = archiveFolderViewer != null ? path : null;
+                isDirectory = true;
+            }
+
+            if (previewPath == null)
                 return;
+        }
 
         // Check extension filtering before proceeding (skip for directories)
-        if (!isDirectory && !ExtensionFilterHelper.IsExtensionAllowed(path))
+        if (!isDirectory && !ExtensionFilterHelper.IsExtensionAllowed(previewPath))
             return;
 
         _invokedPath = path;
+        _previewPath = previewPath;
 
         RunFocusMonitor();
 
-        var matchedPlugin = PluginManager.GetInstance().FindMatch(path);
+        // Stop the previous preview's background work (file reads, folder counting...) before
+        // matching the new path, so it doesn't keep competing for the disk while plugins probe it.
+        var sw = Stopwatch.StartNew();
+        _viewerWindow.UnloadPlugin();
+        var unloadMs = sw.ElapsedMilliseconds;
 
-        BeginShowNewWindow(path, matchedPlugin);
+        sw.Restart();
+        var matchedPlugin = archiveFolderViewer ?? PluginManager.GetInstance().FindMatch(previewPath);
+
+        var fileType = isDirectory ? "<dir>" : Path.GetExtension(previewPath);
+        KeyboardLog.WriteIfSlow("unload", unloadMs);
+        KeyboardLog.WriteIfSlow($"match ({fileType} -> {matchedPlugin.GetType().Namespace})", sw.ElapsedMilliseconds);
+
+        BeginShowNewWindow(previewPath, matchedPlugin);
     }
 
     public void InvokePluginPreview(string plugin, string path = null)
     {
         if (string.IsNullOrEmpty(path))
-            path = _invokedPath;
+            path = _previewPath;
 
         if (string.IsNullOrEmpty(path))
             return;
@@ -203,9 +309,9 @@ public class ViewWindowManager : IDisposable
         if (!_viewerWindow.IsVisible || string.IsNullOrEmpty(_invokedPath))
             return;
 
-        var matchedPlugin = PluginManager.GetInstance().FindMatch(_invokedPath);
+        var matchedPlugin = PluginManager.GetInstance().FindMatch(_previewPath);
 
-        BeginShowNewWindow(_invokedPath, matchedPlugin);
+        BeginShowNewWindow(_previewPath, matchedPlugin);
     }
 
     public void ToggleFullscreen()
