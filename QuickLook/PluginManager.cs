@@ -89,24 +89,12 @@ public sealed class PluginManager
     }
 
     /// <summary>
-    /// Pays the first-use costs (JIT, static constructors, dependent assemblies) after startup instead of
+    /// Pays the first-use costs (JIT, static constructors, dependent assemblies) at startup instead of
     /// on the first preview. Each plugin's CanHandle runs once on the UI thread at idle priority, one plugin
     /// per dispatcher operation so a key press is never held up; then every plugin assembly is compiled
     /// ahead on a low-priority background thread, which also covers Prepare and View.
     /// </summary>
-    internal void WarmUp(TimeSpan delay = default)
-    {
-        if (delay <= TimeSpan.Zero)
-        {
-            WarmUpNow();
-            return;
-        }
-
-        // Let the boot-time work of the other startup programs finish before the warm-up competes with it
-        _ = Task.Delay(delay).ContinueWith(_ => Application.Current.Dispatcher.BeginInvoke(() => WarmUpNow()), TaskScheduler.Default);
-    }
-
-    private void WarmUpNow()
+    internal void WarmUp()
     {
         var sw = Stopwatch.StartNew();
         var probe = Path.Combine(Path.GetTempPath(), "QuickLook.WarmUp.nonexistent.txt");

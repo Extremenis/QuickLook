@@ -382,8 +382,6 @@ public partial class App : Application
         _tooltipSuppressor = new ExplorerTooltipSuppressor();
         PipeServerManager.GetInstance();
 
-        // At logon, the warm-up waits so that it does not slow down the rest of the boot
-        var warmUpDelay = e.Args.Contains("/autorun") ? TimeSpan.FromSeconds(45) : TimeSpan.Zero;
-        PluginManager.GetInstance().WarmUp(warmUpDelay);
+        PluginManager.GetInstance().WarmUp();
     }
 }
