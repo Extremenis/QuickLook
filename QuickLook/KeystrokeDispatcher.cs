@@ -42,11 +42,21 @@ internal class KeystrokeDispatcher : IDisposable
     private int _spaceRepeatCount;
     private int _spaceReleasedChecks;
     private long _lastInvalidKeyPressTick;
+    private long _lastSpacePressTick; // last accepted Space press, to tell a double tap
+    private long _spaceSuppressedUntil; // after a double tap opened the editor, extra taps are ignored
+    private Keys _lastInvalidKey; // for the log only: which key made a valid key count as "typing"
+    private bool _lastInvalidKeyDown;
     private System.Windows.Forms.Timer _spaceWatchdog; // created and ticking on the keyboard hook thread
 
     private const long HOLD_TO_PREVIEW_DURATION = TimeSpan.TicksPerMillisecond * 750;
     private const long VALID_KEY_PRESS_DELAY = TimeSpan.TicksPerSecond * 1;
     private const int SPACE_WATCHDOG_INTERVAL = 100;
+
+    // shorter than the double-click time, so two separate taps (open, then close) are not taken as one
+    private const long DOUBLE_TAP_INTERVAL = TimeSpan.TicksPerMillisecond * 300;
+
+    // a quick third tap after a double tap must not reopen the preview while the editor starts
+    private const long AFTER_DOUBLE_TAP_QUIET = TimeSpan.TicksPerMillisecond * 1000;
 
     protected KeystrokeDispatcher()
     {
@@ -103,6 +113,8 @@ internal class KeystrokeDispatcher : IDisposable
             }
 
             Interlocked.Exchange(ref _lastInvalidKeyPressTick, DateTime.Now.Ticks);
+            _lastInvalidKey = e.KeyCode;
+            _lastInvalidKeyDown = isKeyDown;
 
             // modifiers reveal nothing about what is typed, and explain "right after typing" decisions
             if (IsModifierKey(e.KeyCode) && !(isKeyDown && _hook.IsCurrentEventRepeat))
@@ -154,10 +166,18 @@ internal class KeystrokeDispatcher : IDisposable
             return;
         }
 
+        if (e.KeyCode == Keys.Space && now < _spaceSuppressedUntil)
+        {
+            Log(e, true, "ignored: a double tap just opened the editor");
+            return;
+        }
+
         // skip if key is valid but too close after typing another key
         if (now - Interlocked.Read(ref _lastInvalidKeyPressTick) < VALID_KEY_PRESS_DELAY)
         {
-            Log(e, true, "ignored: right after typing another key");
+            var ago = (now - Interlocked.Read(ref _lastInvalidKeyPressTick)) / TimeSpan.TicksPerMillisecond;
+            Log(e, true, $"ignored: right after typing another key ({DescribeKey(_lastInvalidKey)} " +
+                         $"{(_lastInvalidKeyDown ? "down" : "up")} {ago} ms before)");
             return;
         }
         Interlocked.Exchange(ref _lastInvalidKeyPressTick, 0L);
@@ -171,8 +191,19 @@ internal class KeystrokeDispatcher : IDisposable
         }
 
         _acceptedPresses.Add(e.KeyCode);
-        Log(e, true, "invoke");
-        Dispatch(e.KeyCode, true);
+
+        // a quick second Space edits the file instead of toggling the preview
+        var doubleTap = false;
+        if (e.KeyCode == Keys.Space)
+        {
+            doubleTap = now - _lastSpacePressTick <= DOUBLE_TAP_INTERVAL;
+            _lastSpacePressTick = doubleTap ? 0L : now;
+            if (doubleTap)
+                _spaceSuppressedUntil = now + AFTER_DOUBLE_TAP_QUIET;
+        }
+
+        Log(e, true, doubleTap ? "invoke (double tap)" : "invoke");
+        Dispatch(e.KeyCode, true, doubleTap);
     }
 
     private void OnKeyReleased(KeyEventArgs e, long now)
@@ -200,6 +231,16 @@ internal class KeystrokeDispatcher : IDisposable
         Dispatch(e.KeyCode, false);
     }
 
+    // Names the key behind a "right after typing" decision without revealing what was typed: keys that
+    // produce text are only reported as such.
+    private static string DescribeKey(Keys key)
+    {
+        var isText = key is >= Keys.A and <= Keys.Z or >= Keys.D0 and <= Keys.D9
+            or >= Keys.NumPad0 and <= Keys.Divide
+            or >= Keys.OemSemicolon and <= Keys.Oem102;
+        return isText ? "a character key" : $"{key} (0x{(int)key:X2})";
+    }
+
     private static bool IsModifierKey(Keys key)
     {
         return key is Keys.ShiftKey or Keys.LShiftKey or Keys.RShiftKey
@@ -208,10 +249,10 @@ internal class KeystrokeDispatcher : IDisposable
             or Keys.LWin or Keys.RWin;
     }
 
-    private void Dispatch(Keys key, bool isKeyDown)
+    private void Dispatch(Keys key, bool isKeyDown, bool doubleTap = false)
     {
         // we are on the keyboard hook thread; InvokeRoutine reads settings, which is UI-thread only
-        Application.Current.Dispatcher.BeginInvoke(new Action(() => InvokeRoutine(key, isKeyDown)));
+        Application.Current.Dispatcher.BeginInvoke(new Action(() => InvokeRoutine(key, isKeyDown, doubleTap)));
     }
 
     private void Log(KeyEventArgs e, bool isKeyDown, string outcome)
@@ -257,9 +298,31 @@ internal class KeystrokeDispatcher : IDisposable
             _spaceWatchdog.Stop();
     }
 
-    private void InvokeRoutine(Keys key, bool isKeyDown)
+    private void InvokeRoutine(Keys key, bool isKeyDown, bool doubleTap = false)
     {
         Debug.WriteLine($"InvokeRoutine: key={key},down={isKeyDown}");
+
+        // let the user type in an editable text field of the viewer (e.g. the text editor) without
+        // Space closing the preview or Enter opening the file
+        if (key != Keys.F11 && WindowHelper.IsForegroundWindowBelongToSelf() && IsTypingInTextInput())
+        {
+            KeyboardLog.Write($"{key} {(isKeyDown ? "down" : "up")}: ignored: typing in QuickLook");
+            return;
+        }
+
+        // this Escape only left the editor of the preview: keep the preview open
+        if (key == Keys.Escape && !isKeyDown && ViewWindowManager.GetInstance().ConsumeEscape())
+        {
+            KeyboardLog.Write("Escape up: ignored: it left the editor");
+            return;
+        }
+
+        // Space would close the preview (or replace it) and lose the edits: ignore it until they are saved
+        if (key == Keys.Space && ViewWindowManager.GetInstance().HasUnsavedChanges())
+        {
+            KeyboardLog.Write($"{key} {(isKeyDown ? "down" : "up")}: ignored: the preview has unsaved edits");
+            return;
+        }
 
         if (isKeyDown)
         {
@@ -270,7 +333,9 @@ internal class KeystrokeDispatcher : IDisposable
                     break;
 
                 case Keys.Space:
-                    PipeServerManager.SendMessage(PipeMessages.Toggle);
+                    PipeServerManager.SendMessage(doubleTap && SettingHelper.Get("DoubleSpaceToEdit", true, "QuickLook")
+                        ? PipeMessages.Edit
+                        : PipeMessages.Toggle);
                     break;
 
                 case Keys.F5:
@@ -305,6 +370,30 @@ internal class KeystrokeDispatcher : IDisposable
                     break;
             }
         }
+    }
+
+    private static bool IsTypingInTextInput()
+    {
+        var element = System.Windows.Input.Keyboard.FocusedElement as System.Windows.DependencyObject;
+        while (element != null)
+        {
+            if (element is System.Windows.Controls.Primitives.TextBoxBase textBox)
+                return !textBox.IsReadOnly;
+
+            // AvalonEdit's TextEditor lives in the plugins, so match it (or a subclass such as
+            // the TextViewerPanel) by name
+            for (var type = element.GetType(); type != null; type = type.BaseType)
+            {
+                if (type.FullName == "ICSharpCode.AvalonEdit.TextEditor")
+                    return type.GetProperty("IsReadOnly")?.GetValue(element) is false;
+            }
+
+            element = element is System.Windows.Media.Visual
+                ? System.Windows.Media.VisualTreeHelper.GetParent(element)
+                : System.Windows.LogicalTreeHelper.GetParent(element);
+        }
+
+        return false;
     }
 
     private void InstallKeyHook(KeyEventHandler downHandler, KeyEventHandler upHandler)
